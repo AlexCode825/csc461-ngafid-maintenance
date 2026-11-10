@@ -1,0 +1,25 @@
+# Data. Never commit this: the benchmark subset alone is 1.1 GB and GitHub
+# rejects files over 100 MB.
+ngafid_data/
+2days/
+all_flights/
+*.tar.gz
+*.pkl
+*.parquet
+*.csv
+!results/*.csv
+
+# Model weights and checkpoints
+*.h5
+*.keras
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
