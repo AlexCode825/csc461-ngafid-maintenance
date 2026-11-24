@@ -4,7 +4,7 @@ NGAFID pilot: open the benchmark subset ("2days"), inspect it, and train two cou
 
 What it does
   1. (optional) downloads and extracts the "2days" benchmark subset (1.1 GB), the same file the
-     dataset authors' own code downloads
+     paper's Zenodo record
   2. prints the structure of the data: columns, label counts, folds, flight lengths, missing values,
      and any column that could identify an aircraft, a date or a maintenance event (needed for RQ2)
   3. builds summary features per flight (mean, std, min, quartiles, max for each of the 23 sensors,
@@ -15,7 +15,7 @@ What it does
   6. writes everything to pilot_report.txt so you can paste it back
 
 Usage (Colab or terminal):
-    pip install numpy pandas scikit-learn compress_pickle gdown
+    pip install numpy pandas scikit-learn compress_pickle
     python ngafid_pilot.py --download --data-dir ./ngafid_data
     python ngafid_pilot.py --data-dir ./ngafid_data            # if already downloaded
 
@@ -26,6 +26,7 @@ import os
 import pickle
 import re
 import sys
+import urllib.request
 import tarfile
 import warnings
 
@@ -38,14 +39,16 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-# The benchmark subset ("2days", about 1.1 GB) is hosted on Google Drive by the authors.
-# This is the same file id their own code uses (ngafiddataset/dataset/dataset.py).
-# Needs: pip install gdown
-GDRIVE_2DAYS = "https://drive.google.com/uc?id=1-2pxwiQNhFnhTg7whosQoF_yztD5jOM2"
-# Manual fallback if the Drive link is rate-limited: download the full dataset (4.3 GB) from
-#   https://doi.org/10.5281/zenodo.6624956
+# The benchmark subset ("2days", about 1.1 GB) comes from the dataset's Zenodo record,
+# doi 10.5281/zenodo.6624956, which is the archive the paper cites. Licence: CC BY 4.0.
+# (The authors' own code downloads it from a personal Google Drive link instead; that link
+# no longer resolves, so this script uses Zenodo.)
+ZENODO_2DAYS = "https://zenodo.org/records/6624956/files/2days.tar.gz?download=1"
+# The same record also holds the full dataset, all_flight.tar.gz (4.3 GB), and the dataset
+# is mirrored on Kaggle:
 #   https://www.kaggle.com/datasets/hooong/aviation-maintenance-dataset-from-the-ngafid
-# and point --data-dir at the folder that contains flight_header.csv and flight_data.pkl.
+# To use a copy you downloaded by hand, skip --download and point --data-dir at the folder
+# that holds flight_header.csv and flight_data.pkl.
 MAX_LEN = 4096  # the benchmark keeps the last 4096 seconds of each flight
 REPORT = []
 
@@ -60,15 +63,31 @@ def download(data_dir):
     os.makedirs(data_dir, exist_ok=True)
     archive = os.path.join(data_dir, "2days.tar.gz")
     if not os.path.exists(archive):
-        print("Downloading the '2days' benchmark subset (about 1.1 GB) ...")
+        print("Downloading the '2days' benchmark subset (about 1.1 GB) from Zenodo ...")
+        part = archive + ".part"
         try:
-            import gdown
-        except ImportError:
-            sys.exit("Please run: pip install gdown   (or download the data by hand, see the notes at the top)")
-        gdown.download(GDRIVE_2DAYS, archive, quiet=False)
-    if not os.path.exists(archive):
-        sys.exit("Download failed. Google Drive sometimes rate-limits big files; try again later "
-                 "or download by hand (see the notes at the top of this file).")
+            with urllib.request.urlopen(ZENODO_2DAYS) as resp, open(part, "wb") as out:
+                total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        print(f"\r  {done / 1e6:7.0f} / {total / 1e6:.0f} MB", end="", flush=True)
+            print()
+        except Exception as exc:
+            if os.path.exists(part):
+                os.remove(part)
+            sys.exit(f"Download failed ({exc}). Download 2days.tar.gz by hand from "
+                     "https://doi.org/10.5281/zenodo.6624956 and put it in --data-dir.")
+        os.rename(part, archive)
+    size_mb = os.path.getsize(archive) / 1e6
+    if size_mb < 500:
+        sys.exit(f"{archive} is only {size_mb:.1f} MB; it should be about 1,100 MB. "
+                 "The download was probably an error page. Delete it and try again.")
     print("Extracting ...")
     with tarfile.open(archive) as tar:
         # refuse paths that escape the target directory
@@ -116,8 +135,10 @@ def main():
     ap.add_argument("--data-dir", default="./ngafid_data")
     ap.add_argument("--download", action="store_true")
     ap.add_argument("--max-flights", type=int, default=0, help="debug: use only the first N flights")
-    ap.add_argument("--before-value", type=int, default=0,
-                    help="value of the before_after column that means 'before maintenance' (CHECK this against the crosstab)")
+    ap.add_argument("--before-value", type=int, default=1,
+                    help="value of the before_after column that means 'before maintenance'. It is 1: those rows "
+                         "have a negative date_diff and a non-negative number_flights_before. The run prints both, "
+                         "so the choice can be checked rather than trusted.")
     args = ap.parse_args()
 
     if args.download:
@@ -144,16 +165,26 @@ def main():
             log(f"\nvalue counts for '{col}':")
             log(header[col].value_counts(dropna=False).sort_index().to_string())
 
-    if "filename" in header.columns:
-        log("\nexample file names:", list(header["filename"].head(5)))
+    # How many flights before the repair this one was. The header carries it directly as
+    # 'number_flights_before', with -1 meaning "not applicable" (the flight is after the repair).
+    # Older copies of the data only had it inside the file name, hence the fallback.
+    if "number_flights_before" in header.columns:
+        n_before = pd.to_numeric(header["number_flights_before"], errors="coerce")
+        header["n_before"] = n_before.where(n_before >= 0)
+        log("\n'number_flights_before' found in the header (-1 = flight is after the repair).")
+    elif "filename" in header.columns:
         parts = header["filename"].astype(str).str.replace(r"\.[A-Za-z0-9]+$", "", regex=True).str.split("_")
-        n_before = pd.to_numeric(parts.str[-2], errors="coerce")
-        header["n_before"] = n_before
-        log("parsed 'flights before' from the second-to-last piece of the file name (as in the authors' code):",
-            f"{n_before.notna().mean():.0%} of rows parse as numbers")
-        if "before_after" in header.columns and n_before.notna().any():
-            log("crosstab before_after vs. parsed number (use it to confirm which value means 'before'):")
-            log(pd.crosstab(header["before_after"], n_before.clip(upper=10)).to_string())
+        header["n_before"] = pd.to_numeric(parts.str[-2], errors="coerce")
+        log("\nparsed 'flights before' from the file name (no 'number_flights_before' column).")
+
+    # Which value of before_after means "before the repair"? date_diff settles it: it is the
+    # number of days from the repair, so it is negative for flights before it.
+    if "before_after" in header.columns and "date_diff" in header.columns:
+        log("\nmean date_diff per before_after value (negative = before the repair):")
+        log(header.groupby("before_after")["date_diff"].agg(["mean", "min", "max", "count"]).to_string())
+    if "before_after" in header.columns and "n_before" in header.columns:
+        log("\ncrosstab before_after vs. flights before the repair:")
+        log(pd.crosstab(header["before_after"], header["n_before"].clip(upper=10), dropna=False).to_string())
 
     # ------------------------------------------------------------------ features
     feat_path = os.path.join(args.data_dir, "pilot_features.npz")
